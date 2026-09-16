@@ -1,0 +1,42 @@
+# Visual Studio workspace state and per-user settings
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# Build output and intermediate directories (all platforms/configurations)
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+Win32/
+ARM/
+ARM64/
+[Bb]in/
+[Oo]bj/
+
+# C++ compiler, linker, and resource compiler artifacts
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ipch
+*.ilk
+*.iobj
+*.ipdb
+*.res
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Keep source assets (.ico/.png), project files, and build scripts tracked.

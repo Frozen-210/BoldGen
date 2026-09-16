@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="BoldGen/BoldGen.vcxproj" Id="129514c1-8767-4aac-b26e-209235d3e4e5" />
+</Solution>
