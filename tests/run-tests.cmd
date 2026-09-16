@@ -5,4 +5,8 @@ if not defined BOLDGEN_VS exit /b 1
 "%BOLDGEN_VS%\MSBuild\Current\Bin\MSBuild.exe" "%~dp0HotkeyTests.vcxproj" /p:Configuration=Debug /p:Platform=x64 /v:minimal /nologo
 if errorlevel 1 exit /b 1
 "%~dp0bin\HotkeyTests.exe"
+if errorlevel 1 exit /b 1
+"%BOLDGEN_VS%\MSBuild\Current\Bin\MSBuild.exe" "%~dp0HotkeyTests.vcxproj" /p:Configuration=Debug /p:Platform=x64 /p:TestSource=NativeClipboardTests.cpp /p:TargetName=NativeClipboardTests /p:IntDir=bin\native-obj\ /v:minimal /nologo
+if errorlevel 1 exit /b 1
+"%~dp0bin\NativeClipboardTests.exe"
 exit /b %errorlevel%

@@ -3,22 +3,28 @@
 
 #include <shellapi.h>
 #include <commctrl.h>
+#include <ole2.h>
 
 #include <array>
 #include <string>
 #include <algorithm>
 #include <cstdint>
 #include <atomic>
+#include <memory>
+#include <vector>
 
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Ole32.lib")
 
 #define MAX_LOADSTRING 100
 
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_RUN_HOTKEY = WM_APP + 2;
 constexpr UINT_PTR COMMAND_TIMER = 1;
+constexpr ULONGLONG PASTE_SETTLE_MS = 500;
+constexpr ULONGLONG RESTORE_TIMEOUT_MS = 2000;
 constexpr UINT TRAY_ICON_ID = 1;
 
 constexpr UINT ID_TRAY_SETTINGS = 50001;
@@ -115,12 +121,14 @@ void ShowSettings(HWND owner);
 
 void HandleHotkey(int id, HWND target);
 void AdvanceCommand();
-void FinishCommand(const wchar_t* reason = nullptr);
+void FinishCommand(const wchar_t* reason = nullptr, bool notify = false);
+void RequestExit();
 
 bool SendCtrlCombo(WORD key);
 
 bool ReadClipboardText(HWND hwnd, std::wstring& text, DWORD* sequence = nullptr);
-bool WriteClipboardText(HWND hwnd, const std::wstring& text, const DWORD* expectedSequence = nullptr);
+bool WriteClipboardText(HWND hwnd, const std::wstring& text,
+    const DWORD* expectedSequence = nullptr, DWORD* writtenSequence = nullptr);
 
 std::wstring TransformText(
     const std::wstring& text,
@@ -507,6 +515,164 @@ bool SendCtrlCombo(WORD key)
 // Clipboard
 // ------------------------------------------------------------
 
+UINT ClipboardHandleFormat(UINT format)
+{
+    switch (format)
+    {
+    case CF_DSPBITMAP: return CF_BITMAP;
+    case CF_DSPMETAFILEPICT: return CF_METAFILEPICT;
+    case CF_DSPENHMETAFILE: return CF_ENHMETAFILE;
+    default: return format;
+    }
+}
+
+HANDLE CloneClipboardHandle(UINT format, HANDLE data)
+{
+    format = ClipboardHandleFormat(format);
+    if (format == CF_ENHMETAFILE)
+        return CopyEnhMetaFileW(static_cast<HENHMETAFILE>(data), nullptr);
+    return OleDuplicateData(data, static_cast<CLIPFORMAT>(format), GMEM_MOVEABLE);
+}
+
+void FreeClipboardHandle(UINT format, HANDLE data)
+{
+    if (!data)
+        return;
+    switch (ClipboardHandleFormat(format))
+    {
+    case CF_BITMAP:
+    case CF_PALETTE:
+        DeleteObject(data);
+        break;
+    case CF_ENHMETAFILE:
+        DeleteEnhMetaFile(static_cast<HENHMETAFILE>(data));
+        break;
+    case CF_METAFILEPICT:
+        if (const auto picture = static_cast<METAFILEPICT*>(GlobalLock(data)))
+        {
+            DeleteMetaFile(picture->hMF);
+            GlobalUnlock(data);
+        }
+        GlobalFree(data);
+        break;
+    default:
+        GlobalFree(data);
+        break;
+    }
+}
+
+struct ClipboardBackup
+{
+    struct Entry { UINT format; HANDLE data; };
+    std::vector<Entry> entries;
+
+    ClipboardBackup() = default;
+    ClipboardBackup(const ClipboardBackup&) = delete;
+    ClipboardBackup& operator=(const ClipboardBackup&) = delete;
+    ~ClipboardBackup()
+    {
+        for (const auto& entry : entries)
+            FreeClipboardHandle(entry.format, entry.data);
+    }
+};
+
+enum class ClipboardResult { Success, Retry, Unsupported, Changed };
+
+ClipboardResult BackupClipboard(HWND hwnd, std::unique_ptr<ClipboardBackup>& backup,
+    DWORD& sequence)
+{
+    if (!OpenClipboard(hwnd))
+        return ClipboardResult::Retry;
+
+    auto snapshot = std::make_unique<ClipboardBackup>();
+    ClipboardResult result = ClipboardResult::Success;
+    UINT format = 0;
+    for (;;)
+    {
+        SetLastError(ERROR_SUCCESS);
+        format = EnumClipboardFormats(format);
+        if (format == 0)
+        {
+            if (GetLastError() != ERROR_SUCCESS)
+                result = ClipboardResult::Unsupported;
+            break;
+        }
+        // Owner-display and private GDI formats require the original application's
+        // callbacks/ownership. Refuse the command rather than silently lose them.
+        if (format == CF_OWNERDISPLAY ||
+            (format >= CF_PRIVATEFIRST && format <= CF_PRIVATELAST) ||
+            (format >= CF_GDIOBJFIRST && format <= CF_GDIOBJLAST))
+        {
+            result = ClipboardResult::Unsupported;
+            break;
+        }
+        const HANDLE source = GetClipboardData(format); // Materialize delayed data.
+        const HANDLE copy = source ? CloneClipboardHandle(format, source) : nullptr;
+        if (!copy)
+        {
+            result = ClipboardResult::Unsupported;
+            break;
+        }
+        snapshot->entries.push_back({ format, copy });
+    }
+    sequence = GetClipboardSequenceNumber();
+    CloseClipboard();
+    if (result == ClipboardResult::Success && GetClipboardSequenceNumber() != sequence)
+        result = ClipboardResult::Retry;
+    if (result == ClipboardResult::Success)
+        backup = std::move(snapshot); // An empty clipboard is also a valid backup.
+    return result;
+}
+
+ClipboardResult RestoreClipboard(HWND hwnd, const ClipboardBackup& backup,
+    DWORD& expectedSequence)
+{
+    if (!OpenClipboard(hwnd))
+        return ClipboardResult::Retry;
+    if (GetClipboardSequenceNumber() != expectedSequence)
+    {
+        CloseClipboard();
+        return ClipboardResult::Changed;
+    }
+
+    // Retain the original backup until every format has been restored, so a
+    // partial SetClipboardData failure can be retried without losing formats.
+    ClipboardBackup copies;
+    for (const auto& entry : backup.entries)
+    {
+        HANDLE data = CloneClipboardHandle(entry.format, entry.data);
+        if (!data)
+        {
+            CloseClipboard();
+            return ClipboardResult::Retry;
+        }
+        copies.entries.push_back({ entry.format, data });
+    }
+    if (!EmptyClipboard())
+    {
+        CloseClipboard();
+        return ClipboardResult::Retry;
+    }
+    ClipboardResult result = ClipboardResult::Success;
+    for (auto& entry : copies.entries)
+    {
+        if (!SetClipboardData(entry.format, entry.data))
+        {
+            result = ClipboardResult::Retry;
+            break;
+        }
+        entry.data = nullptr; // Ownership transferred to Windows.
+    }
+    CloseClipboard();
+    // Windows may add synthesized text formats when the clipboard is closed.
+    // Capture the published sequence, not the intermediate open-clipboard value.
+    const DWORD publishedSequence = GetClipboardSequenceNumber();
+    if (GetClipboardOwner() != hwnd)
+        return ClipboardResult::Changed;
+    expectedSequence = publishedSequence;
+    return result;
+}
+
 bool ReadClipboardText(
     HWND hwnd,
     std::wstring& text,
@@ -545,11 +711,14 @@ bool ReadClipboardText(
     const bool valid = end != ptr + capacity;
     if (valid)
         text.assign(ptr, end);
-    if (sequence)
-        *sequence = GetClipboardSequenceNumber();
-
+    const HWND owner = GetClipboardOwner();
     GlobalUnlock(data);
     CloseClipboard();
+    const DWORD publishedSequence = GetClipboardSequenceNumber();
+    if (GetClipboardOwner() != owner)
+        return false;
+    if (sequence)
+        *sequence = publishedSequence;
 
     return valid;
 }
@@ -557,7 +726,8 @@ bool ReadClipboardText(
 bool WriteClipboardText(
     HWND hwnd,
     const std::wstring& text,
-    const DWORD* expectedSequence)
+    const DWORD* expectedSequence,
+    DWORD* writtenSequence)
 {
     SIZE_T bytes =
         (text.size() + 1) *
@@ -608,26 +778,27 @@ bool WriteClipboardText(
         return false;
     }
 
-    if (!SetClipboardData(
+    const bool success = SetClipboardData(
         CF_UNICODETEXT,
-        memory))
-    {
+        memory) != nullptr;
+    if (!success)
         GlobalFree(memory);
-        CloseClipboard();
-        return false;
-    }
 
     // Clipboard owns memory after successful SetClipboardData.
     CloseClipboard();
-
-    return true;
+    const DWORD publishedSequence = GetClipboardSequenceNumber();
+    if (GetClipboardOwner() != hwnd)
+        return false;
+    if (writtenSequence)
+        *writtenSequence = publishedSequence;
+    return success;
 }
 
 // ------------------------------------------------------------
 // Actual hotkey command
 // ------------------------------------------------------------
 
-enum class CommandStage { Idle, ReleaseKeys, Copy, Paste };
+enum class CommandStage { Idle, ReleaseKeys, Copy, Paste, Restore };
 struct Command
 {
     CommandStage stage = CommandStage::Idle;
@@ -637,8 +808,13 @@ struct Command
     HWND focus = nullptr;
     DWORD sequence = 0;
     ULONGLONG deadline = 0;
+    ULONGLONG restoreAfter = 0;
+    bool restoreNeeded = false;
+    bool cancellingCopy = false;
+    std::unique_ptr<ClipboardBackup> backup;
     std::wstring text;
 } g_command;
+bool g_exitRequested = false;
 
 bool IsKeyDown(int vk)
 {
@@ -655,17 +831,66 @@ UINT CurrentModifiers()
     return modifiers;
 }
 
-void FinishCommand(const wchar_t* reason)
+void ClearCommand()
 {
     KillTimer(g_mainWindow, COMMAND_TIMER);
     g_command = {};
     g_commandBusy = false;
+    if (g_exitRequested)
+        PostMessageW(g_mainWindow, WM_CLOSE, 0, 0);
+}
+
+void FinishCommand(const wchar_t* reason, bool notify)
+{
     if (reason)
     {
         OutputDebugStringW(L"BoldGen: ");
         OutputDebugStringW(reason);
         OutputDebugStringW(L"\n");
+        if (notify)
+        {
+            NOTIFYICONDATAW info{};
+            info.cbSize = sizeof(info);
+            info.hWnd = g_mainWindow;
+            info.uID = TRAY_ICON_ID;
+            info.uFlags = NIF_INFO;
+            info.dwInfoFlags = NIIF_WARNING;
+            wcscpy_s(info.szInfoTitle, L"BoldGen");
+            wcsncpy_s(info.szInfo, reason, _TRUNCATE);
+            Shell_NotifyIconW(NIM_MODIFY, &info);
+        }
     }
+    if (g_command.stage == CommandStage::Restore)
+        return; // Settings/Exit must not shorten the paste grace period.
+
+    // Also recognize a completed copy when cancellation happens before the next
+    // timer tick. The clipboard publisher may be a helper process, or may have
+    // already closed its owner window; its PID is not a reliable copy gate.
+    if (g_command.stage == CommandStage::Copy && !g_command.restoreNeeded &&
+        GetClipboardSequenceNumber() != g_command.sequence)
+    {
+        g_command.restoreNeeded = true;
+        g_command.sequence = GetClipboardSequenceNumber();
+    }
+    if (g_command.stage == CommandStage::Copy && !g_command.restoreNeeded &&
+        GetClipboardSequenceNumber() == g_command.sequence &&
+        GetTickCount64() < g_command.deadline)
+    {
+        // Copy is asynchronous too. If Settings/Exit/focus cancellation happens
+        // before the target publishes its selection, wait for it and restore,
+        // without transforming or pasting anything.
+        g_command.cancellingCopy = true;
+        return;
+    }
+    if (g_command.backup && g_command.restoreNeeded)
+    {
+        g_command.stage = CommandStage::Restore;
+        g_command.deadline = (std::max)(GetTickCount64(), g_command.restoreAfter) +
+            RESTORE_TIMEOUT_MS;
+        // Keep the command timer and busy flag alive until restoration finishes.
+        return;
+    }
+    ClearCommand();
 }
 
 bool TargetUnchanged()
@@ -706,6 +931,29 @@ void AdvanceCommand()
 {
     if (g_command.stage == CommandStage::Idle)
         return;
+    if (g_command.stage == CommandStage::Restore)
+    {
+        if (GetTickCount64() < g_command.restoreAfter)
+            return;
+        const auto result = RestoreClipboard(g_mainWindow, *g_command.backup,
+            g_command.sequence);
+        if (result == ClipboardResult::Retry && GetTickCount64() < g_command.deadline)
+            return;
+        if (result == ClipboardResult::Retry)
+            OutputDebugStringW(L"BoldGen: Clipboard restoration timed out.\n");
+        else if (result == ClipboardResult::Changed)
+            OutputDebugStringW(L"BoldGen: New clipboard content preserved; restoration skipped.\n");
+        ClearCommand();
+        return;
+    }
+    if (g_command.cancellingCopy)
+    {
+        if (GetClipboardSequenceNumber() != g_command.sequence)
+            FinishCommand();
+        else if (GetTickCount64() >= g_command.deadline)
+            ClearCommand();
+        return;
+    }
     if (!g_hotkeysEnabled || !TargetUnchanged())
     {
         FinishCommand(L"Command cancelled: focus changed.");
@@ -713,31 +961,49 @@ void AdvanceCommand()
     }
     if (GetTickCount64() >= g_command.deadline)
     {
-        FinishCommand(L"Timed out waiting for key release or clipboard text.");
+        FinishCommand(L"Timed out waiting for key release or copied text. Select text and release all shortcut keys.", true);
         return;
     }
 
     switch (g_command.stage)
     {
     case CommandStage::ReleaseKeys:
+    {
         // Suppressed keys may never enter Windows' async key state. The hook
         // tracks the triggering key explicitly, including its swallowed key-up.
         if (g_suppressedKeyCount != 0 || CurrentModifiers() != 0 || IsKeyDown('C'))
             return;
-        g_command.sequence = GetClipboardSequenceNumber();
-        if (!SendCtrlCombo('C'))
+        const auto result = BackupClipboard(g_mainWindow, g_command.backup,
+            g_command.sequence);
+        if (result == ClipboardResult::Retry)
+            return;
+        if (result != ClipboardResult::Success)
         {
-            FinishCommand(L"Ctrl+C injection failed (check target elevation).");
+            FinishCommand(L"The current clipboard could not be backed up. The selection was left unchanged.", true);
+            return;
+        }
+        if (!TargetUnchanged() || CurrentModifiers() != 0)
+        {
+            FinishCommand(L"Focus or modifiers changed during clipboard backup.");
             return;
         }
         g_command.stage = CommandStage::Copy;
         g_command.deadline = GetTickCount64() + 2000;
+        if (!SendCtrlCombo('C'))
+        {
+            FinishCommand(L"Ctrl+C could not be sent. Check whether the target application is running as administrator.", true);
+            return;
+        }
         break;
+    }
 
     case CommandStage::Copy:
     {
-        if (GetClipboardSequenceNumber() == g_command.sequence)
+        const DWORD sequence = GetClipboardSequenceNumber();
+        if (!g_command.restoreNeeded && sequence == g_command.sequence)
             return; // Never transform stale clipboard contents after a failed copy.
+        g_command.sequence = sequence;
+        g_command.restoreNeeded = true;
         std::wstring source;
         DWORD copiedSequence = 0;
         if (!ReadClipboardText(g_mainWindow, source, &copiedSequence))
@@ -754,6 +1020,7 @@ void AdvanceCommand()
     }
 
     case CommandStage::Paste:
+    {
         if (GetClipboardSequenceNumber() != g_command.sequence)
         {
             FinishCommand(L"Clipboard changed again; paste cancelled.");
@@ -761,22 +1028,51 @@ void AdvanceCommand()
         }
         if (g_suppressedKeyCount != 0 || CurrentModifiers() != 0 || IsKeyDown('V'))
             return;
-        if (!WriteClipboardText(g_mainWindow, g_command.text, &g_command.sequence))
+        DWORD writtenSequence = g_command.sequence;
+        const bool written = WriteClipboardText(g_mainWindow, g_command.text,
+            &g_command.sequence, &writtenSequence);
+        if (!written)
+        {
+            if (writtenSequence != g_command.sequence)
+            {
+                g_command.sequence = writtenSequence;
+                FinishCommand(L"Writing transformed text failed; restoring clipboard.");
+            }
             return;
+        }
+        g_command.sequence = writtenSequence;
         // Clipboard access can trigger delayed rendering; recheck focus after it.
         if (!TargetUnchanged() || CurrentModifiers() != 0)
         {
             FinishCommand(L"Focus or modifiers changed before paste.");
             return;
         }
+        // SendInput queues the paste; it does not acknowledge that the target has
+        // consumed it. Keep transformed text available briefly, even on partial
+        // input failure, before restoring the previous clipboard contents.
+        g_command.restoreAfter = GetTickCount64() + PASTE_SETTLE_MS;
         if (!SendCtrlCombo('V'))
-            FinishCommand(L"Ctrl+V injection failed (check target elevation).");
+            FinishCommand(L"Ctrl+V could not be sent. Check whether the target application is running as administrator.", true);
         else
             FinishCommand();
         break;
+    }
 
+    case CommandStage::Restore:
     case CommandStage::Idle:
         break;
+    }
+}
+
+void RequestExit()
+{
+    g_hotkeysEnabled = false;
+    g_exitRequested = true;
+    FinishCommand();
+    if (g_command.stage == CommandStage::Idle)
+    {
+        g_exitRequested = false;
+        DestroyWindow(g_mainWindow);
     }
 }
 
@@ -1501,16 +1797,20 @@ LRESULT CALLBACK WndProc(
             return 0;
 
         case ID_TRAY_EXIT:
-            DestroyWindow(hWnd);
+            RequestExit();
             return 0;
         }
 
         break;
     }
 
+    case WM_CLOSE:
+        RequestExit();
+        return 0;
+
     case WM_DESTROY:
         StopKeyboardHook();
-        FinishCommand();
+        ClearCommand();
         RemoveTrayIcon(hWnd);
         PostQuitMessage(0);
         return 0;

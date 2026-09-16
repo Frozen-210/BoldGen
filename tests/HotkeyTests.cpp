@@ -3,9 +3,13 @@
 #include "../BoldGen/framework.h"
 #include <shellapi.h>
 #include <commctrl.h>
+#include <ole2.h>
 #include <cstdio>
 #include <vector>
 #include <string>
+#include <map>
+
+void FreeClipboardHandle(UINT format, HANDLE data);
 
 namespace Fake
 {
@@ -16,7 +20,14 @@ namespace Fake
     ULONGLONG now = 100;
     DWORD sequence = 1;
     HGLOBAL clipboard = nullptr;
+    std::map<UINT, HANDLE> extraFormats;
+    HWND clipboardOwner = target;
+    HWND openOwner = nullptr;
+    bool failBackup = false;
+    UINT failSetFormat = 0;
     bool clipboardLocked = false;
+    bool clipboardOpen = false;
+    bool pendingSynthesis = false;
     bool unicode = true;
     bool failCopy = false;
     bool failPaste = false;
@@ -29,7 +40,11 @@ namespace Fake
     SHORT WINAPI AsyncKey(int vk) { return keys[vk] ? SHORT(0x8000) : 0; }
     HWND WINAPI Foreground() { return foreground; }
     BOOL WINAPI WindowExists(HWND hwnd) { return hwnd == target; }
-    DWORD WINAPI WindowThread(HWND, LPDWORD) { return 10; }
+    DWORD WINAPI WindowThread(HWND hwnd, LPDWORD process)
+    {
+        if (process) *process = hwnd == target ? 1000 : 2000;
+        return 10;
+    }
     BOOL WINAPI GuiInfo(DWORD, PGUITHREADINFO info)
     {
         info->hwndFocus = focus;
@@ -57,21 +72,66 @@ namespace Fake
         return count;
     }
     DWORD WINAPI Sequence() { return sequence; }
-    BOOL WINAPI Open(HWND) { return !clipboardLocked; }
-    BOOL WINAPI Close() { return TRUE; }
-    BOOL WINAPI Format(UINT) { return unicode && clipboard != nullptr; }
-    HANDLE WINAPI GetData(UINT) { return clipboard; }
+    BOOL WINAPI Open(HWND hwnd)
+    {
+        if (clipboardLocked) return FALSE;
+        openOwner = hwnd;
+        clipboardOpen = true;
+        return TRUE;
+    }
+    BOOL WINAPI Close()
+    {
+        // Real Windows publishes synthesized text formats at CloseClipboard,
+        // which changes the sequence after the last SetClipboardData call.
+        if (pendingSynthesis && clipboard) sequence += 3;
+        pendingSynthesis = false;
+        clipboardOpen = false;
+        return TRUE;
+    }
+    HWND WINAPI Owner() { return clipboardOwner; }
+    BOOL WINAPI Format(UINT format)
+    {
+        return format == CF_UNICODETEXT ? unicode && clipboard != nullptr :
+            extraFormats.count(format) != 0;
+    }
+    UINT WINAPI Formats(UINT previous)
+    {
+        if (!previous && clipboard) return CF_UNICODETEXT;
+        const auto it = extraFormats.upper_bound(previous == CF_UNICODETEXT ? 0 : previous);
+        return it != extraFormats.end() ? it->first : 0;
+    }
+    HANDLE WINAPI GetData(UINT format)
+    {
+        if (failBackup) return nullptr;
+        if (format == CF_UNICODETEXT) return clipboard;
+        const auto it = extraFormats.find(format);
+        return it != extraFormats.end() ? it->second : nullptr;
+    }
     BOOL WINAPI Empty()
     {
         if (clipboard) GlobalFree(clipboard);
         clipboard = nullptr;
+        for (const auto& entry : extraFormats) FreeClipboardHandle(entry.first, entry.second);
+        extraFormats.clear();
+        clipboardOwner = openOwner;
+        pendingSynthesis = clipboardOpen;
         ++sequence;
         return TRUE;
     }
-    HANDLE WINAPI SetData(UINT, HANDLE data)
+    HANDLE WINAPI SetData(UINT format, HANDLE data)
     {
-        clipboard = data;
-        unicode = true;
+        if (format == failSetFormat) return nullptr;
+        if (format == CF_UNICODETEXT)
+        {
+            if (clipboard) GlobalFree(clipboard);
+            clipboard = data;
+            unicode = true;
+        }
+        else
+        {
+            if (extraFormats.count(format)) FreeClipboardHandle(format, extraFormats[format]);
+            extraFormats[format] = data;
+        }
         ++sequence;
         return data;
     }
@@ -83,6 +143,16 @@ namespace Fake
         memcpy(memory, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
         GlobalUnlock(clipboard);
         unicode = true;
+        clipboardOwner = target;
+    }
+    void AddBytes(UINT format, const char* text)
+    {
+        const size_t size = strlen(text) + 1;
+        HGLOBAL data = GlobalAlloc(GMEM_MOVEABLE, size);
+        void* memory = GlobalLock(data);
+        memcpy(memory, text, size);
+        GlobalUnlock(data);
+        SetData(format, data);
     }
 }
 
@@ -104,6 +174,8 @@ namespace Fake
 #define GetClipboardData Fake::GetData
 #define EmptyClipboard Fake::Empty
 #define SetClipboardData Fake::SetData
+#define EnumClipboardFormats Fake::Formats
+#define GetClipboardOwner Fake::Owner
 #include "../BoldGen/BoldGen.cpp"
 
 int checks = 0;
@@ -119,7 +191,7 @@ void Check(bool success, const char* description)
 
 void Reset()
 {
-    FinishCommand();
+    ClearCommand();
     std::fill(std::begin(Fake::keys), std::end(Fake::keys), false);
     g_keysDown.fill(false);
     g_suppressedKeys.fill(false);
@@ -135,6 +207,10 @@ void Reset()
     Fake::nextHook = 0;
     Fake::failPost = Fake::failCopy = Fake::failPaste = false;
     Fake::clipboardLocked = false;
+    Fake::clipboardOpen = Fake::pendingSynthesis = false;
+    Fake::failBackup = false;
+    Fake::failSetFormat = 0;
+    g_exitRequested = false;
     Fake::combos.clear();
     Fake::Publish(L"old clipboard");
 }
@@ -166,6 +242,18 @@ void Release()
     Key(VK_MENU, false);
 }
 
+void PasteSelection()
+{
+    Trigger(); Release(); AdvanceCommand();
+    Fake::Publish(L"Ab9"); AdvanceCommand(); AdvanceCommand();
+}
+
+bool ClipboardEquals(const wchar_t* expected)
+{
+    std::wstring text;
+    return ReadClipboardText(g_mainWindow, text) && text == expected;
+}
+
 int main()
 {
     Reset();
@@ -193,8 +281,14 @@ int main()
     std::wstring result;
     Check(ReadClipboardText(g_mainWindow, result) &&
         result == L"\U0001D400\U0001D41B\U0001D7D7", "correct bold clipboard output");
-    Check(Fake::combos == std::vector<WORD>{'C', 'V'} && !g_commandBusy,
-        "one copy and one paste complete the command");
+    Check(Fake::combos == std::vector<WORD>{'C', 'V'} && g_commandBusy,
+        "one copy and one paste precede restoration");
+    AdvanceCommand();
+    Check(g_command.stage == CommandStage::Restore, "restoration waits for paste to settle");
+    Fake::now += PASTE_SETTLE_MS;
+    AdvanceCommand();
+    Check(ReadClipboardText(g_mainWindow, result) && result == L"old clipboard" &&
+        !g_commandBusy, "original clipboard restored after paste");
 
     Reset();
     Trigger();
@@ -246,29 +340,147 @@ int main()
     Reset(); Trigger(); Release(); AdvanceCommand();
     Fake::Publish(L"not text"); Fake::unicode = false;
     AdvanceCommand(); Fake::now += 2100; AdvanceCommand();
+    AdvanceCommand();
     Check(!g_commandBusy && Fake::combos.size() == 1, "non-text is never pasted");
 
     Reset(); Trigger(); Release(); AdvanceCommand();
     Fake::Publish(L"hello"); AdvanceCommand();
     Fake::foreground = nullptr;
     AdvanceCommand();
+    AdvanceCommand();
     Check(!g_commandBusy && Fake::combos.size() == 1, "changed window cancels paste");
     Reset(); Trigger(); Release(); AdvanceCommand();
     Fake::Publish(L"hello"); AdvanceCommand();
     Fake::focus = reinterpret_cast<HWND>(102);
     AdvanceCommand();
+    AdvanceCommand();
     Check(!g_commandBusy && Fake::combos.size() == 1, "changed control cancels paste");
     Reset(); Trigger(); Release(); AdvanceCommand();
     Fake::Publish(L"hello"); AdvanceCommand(); Fake::Publish(L"new copy");
     AdvanceCommand();
+    AdvanceCommand();
     Check(!g_commandBusy && Fake::combos.size() == 1, "new clipboard cancels paste");
 
     Reset(); Trigger(); Release(); Fake::failCopy = true; AdvanceCommand();
+    Fake::now += 2100; AdvanceCommand();
     Check(!g_commandBusy, "failed Ctrl+C ends the operation");
     Reset(); Trigger(); Release(); AdvanceCommand();
     Fake::Publish(L"hello"); AdvanceCommand(); Fake::failPaste = true;
     AdvanceCommand();
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
     Check(!g_commandBusy, "failed Ctrl+V ends the operation");
+    Check(ClipboardEquals(L"old clipboard"), "failed paste restores original clipboard");
+
+    Reset();
+    constexpr UINT htmlFormat = 0xC001;
+    Fake::AddBytes(htmlFormat, "<b>original rich text</b>");
+    const DWORD pixels[] = { 0x000000FF, 0x0000FF00, 0x00FF0000, 0x00FFFFFF };
+    Fake::SetData(CF_BITMAP, CreateBitmap(2, 2, 1, 32, pixels));
+    PasteSelection();
+    Check(Fake::extraFormats.empty(), "only transformed text is exposed for paste");
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(ClipboardEquals(L"old clipboard"), "multi-format backup restores plain text");
+    const auto html = static_cast<const char*>(GlobalLock(Fake::GetData(htmlFormat)));
+    Check(html && strcmp(html, "<b>original rich text</b>") == 0,
+        "registered rich-text format restored byte-for-byte");
+    GlobalUnlock(Fake::GetData(htmlFormat));
+    DWORD restoredPixels[4]{};
+    Check(GetBitmapBits(static_cast<HBITMAP>(Fake::GetData(CF_BITMAP)),
+        sizeof(restoredPixels), restoredPixels) == sizeof(restoredPixels) &&
+        memcmp(pixels, restoredPixels, sizeof(pixels)) == 0, "bitmap handles are deep-copied");
+
+    Reset(); Fake::Empty(); PasteSelection();
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(!Fake::clipboard && Fake::extraFormats.empty() && !g_commandBusy,
+        "originally empty clipboard is restored to empty");
+
+    Reset(); Trigger(); Release(); Fake::clipboardLocked = true; AdvanceCommand();
+    Check(Fake::combos.empty() && !g_command.backup, "copy waits for a complete backup");
+    Fake::clipboardLocked = false; AdvanceCommand();
+    Check(g_command.backup != nullptr && Fake::combos.size() == 1,
+        "copy begins only after backup succeeds");
+
+    Reset(); Fake::failBackup = true; Trigger(); Release(); AdvanceCommand();
+    Check(Fake::combos.empty() && !g_commandBusy, "unreadable original clipboard cancels copy");
+    Fake::failBackup = false;
+    Check(ClipboardEquals(L"old clipboard"), "failed backup preserves original content");
+    Reset(); Fake::AddBytes(CF_OWNERDISPLAY, "owner-dependent data");
+    Trigger(); Release(); AdvanceCommand();
+    Check(!g_commandBusy && Fake::combos.empty() && ClipboardEquals(L"old clipboard"),
+        "unsupported owner-dependent format cancels without clipboard loss");
+    // Fake owner-display storage is only test memory; Windows does not free it.
+    GlobalFree(Fake::extraFormats[CF_OWNERDISPLAY]);
+    Fake::extraFormats.erase(CF_OWNERDISPLAY);
+
+    Reset(); PasteSelection(); Fake::clipboardLocked = true;
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(g_commandBusy, "clipboard lock delays restoration");
+    Fake::clipboardLocked = false; AdvanceCommand();
+    Check(!g_commandBusy && ClipboardEquals(L"old clipboard"), "locked restoration is retried");
+
+    Reset(); PasteSelection(); Fake::Publish(L"new user clipboard");
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(!g_commandBusy && ClipboardEquals(L"new user clipboard"),
+        "restoration never overwrites a newer clipboard change");
+
+    Reset(); Fake::AddBytes(htmlFormat, "rich backup"); PasteSelection();
+    Fake::failSetFormat = htmlFormat; Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(g_commandBusy && g_command.backup->entries.size() == 2,
+        "partial restore retains a complete backup for retry");
+    Fake::failSetFormat = 0; AdvanceCommand();
+    Check(!g_commandBusy && Fake::Format(htmlFormat) && ClipboardEquals(L"old clipboard"),
+        "partial restore retry recovers every original format");
+
+    Reset(); Trigger(); Release(); AdvanceCommand(); Fake::Publish(L"selection");
+    AdvanceCommand(); Fake::failSetFormat = CF_UNICODETEXT; AdvanceCommand();
+    Check(g_command.stage == CommandStage::Restore && Fake::combos.size() == 1,
+        "failed transformed write initiates restoration without pasting");
+    Fake::failSetFormat = 0; AdvanceCommand();
+    Check(ClipboardEquals(L"old clipboard") && !g_commandBusy,
+        "clipboard restored even after transformed write emptied it");
+
+    Reset(); PasteSelection(); g_hotkeysEnabled = false; FinishCommand();
+    AdvanceCommand();
+    Check(g_commandBusy && g_command.stage == CommandStage::Restore,
+        "settings cannot prematurely restore an in-flight paste");
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(!g_commandBusy && ClipboardEquals(L"old clipboard"),
+        "restoration continues while settings are open");
+
+    Reset(); Trigger(); Release(); AdvanceCommand();
+    Fake::foreground = nullptr; AdvanceCommand();
+    Check(g_command.cancellingCopy && g_commandBusy, "cancel waits for an in-flight copy");
+    Fake::Publish(L"late selection"); AdvanceCommand(); AdvanceCommand();
+    Check(!g_commandBusy && ClipboardEquals(L"old clipboard") && Fake::combos.size() == 1,
+        "late copy is restored after cancellation without paste");
+
+    Reset(); PasteSelection(); RequestExit();
+    Check(g_exitRequested && g_commandBusy, "exit waits for pending restoration");
+    Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(!g_commandBusy && ClipboardEquals(L"old clipboard") && Fake::posted == 2,
+        "exit is queued after original clipboard is restored");
+
+    Reset(); Trigger(); Release(); AdvanceCommand();
+    Fake::Publish(L"selection from a clipboard helper");
+    Fake::clipboardOwner = reinterpret_cast<HWND>(300); AdvanceCommand();
+    Check(g_command.stage == CommandStage::Paste,
+        "fresh copy from a helper process is accepted");
+    AdvanceCommand(); Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(!g_commandBusy && Fake::combos.size() == 2 && ClipboardEquals(L"old clipboard"),
+        "helper-process copy is transformed, pasted, and original clipboard restored");
+
+    Reset(); Trigger(); Release(); AdvanceCommand();
+    Fake::Publish(L"selection whose owner window has closed");
+    Fake::clipboardOwner = nullptr; AdvanceCommand();
+    Check(g_command.stage == CommandStage::Paste, "valid ownerless clipboard text is accepted");
+    AdvanceCommand(); Fake::now += PASTE_SETTLE_MS; AdvanceCommand();
+    Check(!g_commandBusy && ClipboardEquals(L"old clipboard"),
+        "ownerless copy completes with restoration");
+
+    Reset(); PasteSelection(); Fake::clipboardLocked = true;
+    Fake::now += PASTE_SETTLE_MS + RESTORE_TIMEOUT_MS; AdvanceCommand();
+    Check(!g_commandBusy, "restoration timeout releases command state");
+    Fake::clipboardLocked = false;
 
     const std::wstring plain = L"ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789 !\n\U0001F600";
     for (int i = 0; i < 6; ++i)
@@ -280,5 +492,5 @@ int main()
             "restyling existing decoration works");
     }
     Fake::Empty();
-    std::printf("PASS: %d checks (hook handling, copy/paste, Unicode).\n", checks);
+    std::printf("PASS: %d checks (hook handling, copy/paste/restoration, Unicode).\n", checks);
 }

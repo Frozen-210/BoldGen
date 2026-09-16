@@ -41,7 +41,8 @@ be inside the tray's hidden-icons menu.
 2. Select text in an application that supports `Ctrl+C` and `Ctrl+V`.
 3. Press the desired shortcut, then release all of its keys.
 
-BoldGen copies the selection, applies the chosen style, and pastes it back.
+BoldGen backs up the clipboard, copies the selection, applies the chosen style,
+pastes it back, and restores the previous clipboard contents.
 Choose **Reset** to restore text decorated with one of the supported styles.
 You can also switch directly from one style to another without resetting first.
 
@@ -67,7 +68,18 @@ close BoldGen.
   font formatting. Latin letters (`A–Z`, `a–z`) and digits are converted where the
   selected style has equivalents. The italic styles leave digits plain. Other
   characters, including punctuation and emoji, are preserved.
-- The transformed text stays on the clipboard, replacing its previous contents.
+- Clipboard backup preserves the available formats, including text, rich text,
+  images, and file lists. An originally empty clipboard is restored to empty.
+  If a format cannot be backed up safely, the command is cancelled before copying.
+- Restoration waits 500 ms after sending paste to give the target application time
+  to read the transformed text. This is a timing allowance, not a paste-completion
+  acknowledgment; unusually slow applications may need longer. Clipboard access
+  failures are retried for up to two seconds during restoration and logged if
+  restoration cannot complete.
+- If the clipboard changes again before restoration, the newer contents are kept.
+  Cancelled or failed operations also restore the backup when their copy changed
+  the clipboard. Opening Settings or choosing Exit allows pending restoration
+  to finish.
 - A command is cancelled if the foreground window or focused control changes.
   If copying does not produce fresh text, nothing is pasted.
 - Shortcuts are paused while Settings is open. Repeated key presses and
@@ -86,11 +98,14 @@ From the repository root, run:
 .\tests\run-tests.cmd
 ```
 
-The script builds and runs tests against the production callback and command
-pipeline using simulated keyboard and clipboard I/O. It does not install a
-global hook or change the desktop clipboard. Coverage includes modifier matching,
+The script runs simulated regression checks and a native integration test using
+the real Windows clipboard and an EDIT control in an isolated window station.
+Keyboard delivery is simulated; the tests do not install a global hook or change
+your desktop clipboard. Coverage includes modifier matching,
 key repeats, injected input, delayed copy, clipboard contention, focus changes,
-input failures, and Unicode conversions.
+input failures, Unicode conversions, and clipboard backup/restoration (including
+multiple formats, images, cancellation, and preservation of newer clipboard data).
+The native test checks all seven styles and Windows-synthesized clipboard formats.
 
 For a live check, launch your build, select text in Notepad, and try each style
 and Reset. Test any conflicting shortcut with the other application running;
@@ -101,8 +116,9 @@ BoldGen instances before testing a new build.
 
 A dedicated thread runs the `WH_KEYBOARD_LL` hook. The main window uses a timer to
 wait for key release (up to five seconds), fresh clipboard text (up to two
-seconds), and paste readiness. Failures are sent to the debugger's Output window
-with a `BoldGen:` prefix.
+seconds), paste readiness, and clipboard restoration. Failures are sent to the
+debugger's Output window with a `BoldGen:` prefix. Backup, input-injection, and
+copy-timeout failures also display a tray notification instead of failing silently.
 
 The icon resources can be regenerated with `tools\Generate-Icons.ps1`.
 

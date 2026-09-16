@@ -19,6 +19,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
+    <TestSource Condition="'$(TestSource)' == ''">HotkeyTests.cpp</TestSource>
     <OutDir>$(MSBuildThisFileDirectory)bin\</OutDir>
     <IntDir>$(MSBuildThisFileDirectory)bin\obj\</IntDir>
   </PropertyGroup>
@@ -31,6 +32,6 @@
     </ClCompile>
     <Link><SubSystem>Console</SubSystem></Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="HotkeyTests.cpp" /></ItemGroup>
+  <ItemGroup><ClCompile Include="$(TestSource)" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
