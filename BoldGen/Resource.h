@@ -26,6 +26,9 @@
 #define IDC_HK_DOUBLE_STRUCK         1105
 #define IDC_HK_CODE                  1106
 #define IDC_HK_RESET                 1107
+#define IDC_RUN_AT_STARTUP           1110
+#define IDC_ABOUT_BUTTON             1111
+#define IDC_CAPTURE_BUTTON           1112
 // Next default values for new objects
 //
 #ifdef APSTUDIO_INVOKED

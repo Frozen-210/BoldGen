@@ -63,6 +63,8 @@ std::array<Hotkey, HOTKEY_COUNT> g_hotkeys =
 } };
 
 std::array<Hotkey, HOTKEY_COUNT> g_pendingHotkeys;
+bool g_excludeFromCapture = false;
+bool g_pendingExcludeFromCapture = false;
 
 // The hook has its own message loop. Clipboard work never runs on that thread.
 HANDLE g_hookThread = nullptr;
@@ -108,6 +110,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow);
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK SettingsProc(HWND, UINT, WPARAM, LPARAM);
+INT_PTR CALLBACK AboutProc(HWND, UINT, WPARAM, LPARAM);
 
 bool AddTrayIcon(HWND hwnd);
 void RemoveTrayIcon(HWND hwnd);
@@ -398,6 +401,68 @@ std::wstring TransformText(
 // ------------------------------------------------------------
 // Registry persistence
 // ------------------------------------------------------------
+
+constexpr wchar_t STARTUP_KEY[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+bool StartupEnabled()
+{
+    DWORD bytes = 0;
+    return RegGetValueW(HKEY_CURRENT_USER, STARTUP_KEY, L"BoldGen", RRF_RT_REG_SZ,
+        nullptr, nullptr, &bytes) == ERROR_SUCCESS && bytes > sizeof(wchar_t);
+}
+
+LONG SetStartupEnabled(bool enabled)
+{
+    HKEY key = nullptr;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_KEY, 0, nullptr, 0,
+        KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (result != ERROR_SUCCESS)
+        return result;
+    if (enabled)
+    {
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+        if (!length || length >= ARRAYSIZE(path) || length + 2 >= MAX_PATH)
+            result = ERROR_FILENAME_EXCED_RANGE;
+        else
+        {
+            const std::wstring command = L"\"" + std::wstring(path) + L"\"";
+            result = RegSetValueExW(key, L"BoldGen", 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(command.c_str()),
+                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+        }
+    }
+    else
+    {
+        result = RegDeleteValueW(key, L"BoldGen");
+        if (result == ERROR_FILE_NOT_FOUND)
+            result = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+    return result;
+}
+
+void LoadCapturePreference()
+{
+    DWORD value = 0, bytes = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BoldGen", L"ExcludeFromCapture",
+        RRF_RT_REG_DWORD, nullptr, &value, &bytes) == ERROR_SUCCESS)
+        g_excludeFromCapture = value != 0;
+}
+
+LONG SaveCapturePreference(bool excluded)
+{
+    HKEY key = nullptr;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BoldGen", 0, nullptr,
+        0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (result != ERROR_SUCCESS)
+        return result;
+    const DWORD value = excluded ? 1 : 0;
+    result = RegSetValueExW(key, L"ExcludeFromCapture", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+    return result;
+}
 
 void LoadHotkeys()
 {
@@ -1374,9 +1439,158 @@ bool IsReservedInternalHotkey(
         hk.vk == 'V';
 }
 
+void UpdateCaptureButton(HWND dialog)
+{
+    SetDlgItemTextW(dialog, IDC_CAPTURE_BUTTON, g_pendingExcludeFromCapture ?
+        L"Show in screen captures" : L"Hide from screen captures");
+    InvalidateRect(GetDlgItem(dialog, IDC_CAPTURE_BUTTON), nullptr, TRUE);
+}
+
+bool ApplyCapturePreference(HWND window, bool excluded)
+{
+    return SetWindowDisplayAffinity(window, excluded ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE) != FALSE;
+}
+
+void InitializeSettingsOptions(HWND dialog)
+{
+    // Reserve a compact toolbar above the existing fields. Icon buttons are
+    // 24 logical pixels square; the rest of the layout retains dialog-unit sizing.
+    const UINT dpi = GetDpiForWindow(dialog);
+    const int iconSize = MulDiv(24, dpi, 96);
+    const int gap = MulDiv(6, dpi, 96);
+    const int headerHeight = iconSize + gap;
+    RECT bounds{};
+    GetWindowRect(dialog, &bounds);
+    SetWindowPos(dialog, nullptr, 0, 0, bounds.right - bounds.left,
+        bounds.bottom - bounds.top + headerHeight, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    for (HWND child = GetWindow(dialog, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+    {
+        RECT rect{};
+        GetWindowRect(child, &rect);
+        MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT*>(&rect), 2);
+        SetWindowPos(child, nullptr, rect.left, rect.top + headerHeight, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    const auto place = [dialog, headerHeight](HWND control, int x, int y, int width, int height)
+    {
+        RECT rect{ x, y, x + width, y + height };
+        MapDialogRect(dialog, &rect);
+        SetWindowPos(control, nullptr, rect.left, rect.top + headerHeight, rect.right - rect.left,
+            rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SendMessageW(control, WM_SETFONT, SendMessageW(dialog, WM_GETFONT, 0, 0), TRUE);
+    };
+    const auto add = [dialog, &place](int id, const wchar_t* type, const wchar_t* text,
+        DWORD style, int x, int y, int width, int height)
+    {
+        HWND control = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style,
+            0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst, nullptr);
+        place(control, x, y, width, height);
+        return control;
+    };
+    HWND startup = add(IDC_RUN_AT_STARTUP, L"BUTTON", L"Run at &startup",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 10, 150, 125, 14);
+    HWND eye = add(IDC_CAPTURE_BUTTON, L"BUTTON", L"Hide from screen captures",
+        BS_OWNERDRAW | WS_TABSTOP, 0, 0, 16, 16);
+    HWND about = add(IDC_ABOUT_BUTTON, L"BUTTON", L"?",
+        BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 16, 16);
+    RECT toolbar{ 0, 6, 245, 0 };
+    MapDialogRect(dialog, &toolbar);
+    SetWindowPos(about, nullptr, toolbar.right - 2 * iconSize - gap, toolbar.top,
+        iconSize, iconSize, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(eye, nullptr, toolbar.right - iconSize, toolbar.top,
+        iconSize, iconSize, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(startup, GetDlgItem(dialog, IDC_HK_RESET), 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(eye, startup, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(about, eye, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(GetDlgItem(dialog, IDOK), about, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    CheckDlgButton(dialog, IDC_RUN_AT_STARTUP, StartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+
+    HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        CW_USEDEFAULT, dialog, nullptr, hInst, nullptr);
+    for (HWND button : { eye, about })
+    {
+        TOOLINFOW tool{ sizeof(tool) };
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = dialog;
+        tool.uId = reinterpret_cast<UINT_PTR>(button);
+        tool.lpszText = const_cast<wchar_t*>(button == about ? L"About BoldGen" :
+            L"Toggle visibility in screen captures");
+        SendMessageW(tips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    }
+    if (g_pendingExcludeFromCapture && !ApplyCapturePreference(dialog, true))
+    {
+        g_pendingExcludeFromCapture = false;
+        MessageBoxW(dialog, L"Windows could not enable capture exclusion for this dialog.",
+            L"BoldGen", MB_OK | MB_ICONWARNING);
+    }
+    UpdateCaptureButton(dialog);
+}
+
+void DrawCaptureButton(const DRAWITEMSTRUCT& item)
+{
+    RECT rect = item.rcItem;
+    DrawFrameControl(item.hDC, &rect, DFC_BUTTON, DFCS_BUTTONPUSH |
+        ((item.itemState & ODS_SELECTED) ? DFCS_PUSHED : 0));
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    const int x = (rect.left + rect.right) / 2 + ((item.itemState & ODS_SELECTED) ? 1 : 0);
+    const int y = (rect.top + rect.bottom) / 2 + ((item.itemState & ODS_SELECTED) ? 1 : 0);
+    const int rx = width / 3, ry = height / 4;
+    HPEN pen = CreatePen(PS_SOLID, (std::max)(1, width / 22), GetSysColor(COLOR_BTNTEXT));
+    HGDIOBJ oldPen = SelectObject(item.hDC, pen);
+    HGDIOBJ oldBrush = SelectObject(item.hDC, GetStockObject(HOLLOW_BRUSH));
+    POINT outline[] = { {x-rx,y}, {x-rx/2,y-2*ry}, {x+rx/2,y-2*ry}, {x+rx,y},
+        {x+rx/2,y+2*ry}, {x-rx/2,y+2*ry}, {x-rx,y} };
+    PolyBezier(item.hDC, outline, ARRAYSIZE(outline));
+    Ellipse(item.hDC, x - ry/2, y - ry/2, x + ry/2 + 1, y + ry/2 + 1);
+    if (g_pendingExcludeFromCapture)
+    {
+        MoveToEx(item.hDC, x - rx, y + ry + 2, nullptr);
+        LineTo(item.hDC, x + rx, y - ry - 2);
+    }
+    SelectObject(item.hDC, oldBrush);
+    SelectObject(item.hDC, oldPen);
+    DeleteObject(pen);
+    if (item.itemState & ODS_FOCUS)
+    {
+        InflateRect(&rect, -3, -3);
+        DrawFocusRect(item.hDC, &rect);
+    }
+}
+
+INT_PTR CALLBACK AboutProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_INITDIALOG)
+    {
+        SetWindowLongPtrW(dialog, GWL_EXSTYLE,
+            GetWindowLongPtrW(dialog, GWL_EXSTYLE) & ~WS_EX_DLGMODALFRAME);
+        SendMessageW(dialog, WM_SETICON, ICON_SMALL,
+            reinterpret_cast<LPARAM>(LoadIconW(hInst, MAKEINTRESOURCEW(IDI_SMALL))));
+        SendMessageW(dialog, WM_SETICON, ICON_BIG,
+            reinterpret_cast<LPARAM>(LoadIconW(hInst, MAKEINTRESOURCEW(IDI_BOLDGEN))));
+        if (lParam && !ApplyCapturePreference(dialog, true))
+        {
+            EndDialog(dialog, -1);
+            return FALSE;
+        }
+        return TRUE;
+    }
+    if (message == WM_CLOSE || (message == WM_COMMAND &&
+        (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)))
+    {
+        EndDialog(dialog, IDOK);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 void ShowSettings(HWND owner)
 {
     g_pendingHotkeys = g_hotkeys;
+    g_pendingExcludeFromCapture = g_excludeFromCapture;
 
     // Keep the hook alive to track releases, but let shortcuts reach the controls.
     g_hotkeysEnabled = false;
@@ -1395,6 +1609,7 @@ void ShowSettings(HWND owner)
         g_hotkeys = g_pendingHotkeys;
         ReleaseSRWLockExclusive(&g_hotkeyLock);
         SaveHotkeys();
+        g_excludeFromCapture = g_pendingExcludeFromCapture;
     }
     g_hotkeysEnabled = true;
 }
@@ -1405,8 +1620,6 @@ INT_PTR CALLBACK SettingsProc(
     WPARAM wParam,
     LPARAM lParam)
 {
-    UNREFERENCED_PARAMETER(lParam);
-
     switch (message)
     {
     case WM_INITDIALOG:
@@ -1463,13 +1676,40 @@ INT_PTR CALLBACK SettingsProc(
                 0);
         }
 
+        InitializeSettingsOptions(hDlg);
         return TRUE;
     }
+
+    case WM_DRAWITEM:
+        if (wParam == IDC_CAPTURE_BUTTON)
+        {
+            DrawCaptureButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
+        }
+        break;
 
     case WM_COMMAND:
     {
         switch (LOWORD(wParam))
         {
+        case IDC_ABOUT_BUTTON:
+            if (DialogBoxParamW(hInst, MAKEINTRESOURCEW(IDD_ABOUTBOX), hDlg, AboutProc,
+                g_pendingExcludeFromCapture) == -1)
+                MessageBoxW(hDlg, L"The About dialog could not be opened with the requested capture setting.",
+                    L"BoldGen", MB_OK | MB_ICONWARNING);
+            return TRUE;
+
+        case IDC_CAPTURE_BUTTON:
+            if (ApplyCapturePreference(hDlg, !g_pendingExcludeFromCapture))
+            {
+                g_pendingExcludeFromCapture = !g_pendingExcludeFromCapture;
+                UpdateCaptureButton(hDlg);
+            }
+            else
+                MessageBoxW(hDlg, L"Windows could not change capture visibility.",
+                    L"BoldGen", MB_OK | MB_ICONWARNING);
+            return TRUE;
+
         case IDOK:
         {
             std::array<Hotkey, HOTKEY_COUNT> temp{};
@@ -1548,6 +1788,20 @@ INT_PTR CALLBACK SettingsProc(
                 }
             }
 
+            // Validate before saving anything. A failure leaves Settings open.
+            LONG saved = SaveCapturePreference(g_pendingExcludeFromCapture);
+            if (saved == ERROR_SUCCESS)
+            {
+                saved = SetStartupEnabled(IsDlgButtonChecked(hDlg, IDC_RUN_AT_STARTUP) == BST_CHECKED);
+                if (saved != ERROR_SUCCESS)
+                    SaveCapturePreference(g_excludeFromCapture);
+            }
+            if (saved != ERROR_SUCCESS)
+            {
+                MessageBoxW(hDlg, L"Could not save startup or capture preferences. Check registry permissions and the executable path.",
+                    L"BoldGen", MB_OK | MB_ICONERROR);
+                return TRUE;
+            }
             g_pendingHotkeys = temp;
 
             EndDialog(
@@ -1611,6 +1865,7 @@ int APIENTRY wWinMain(
             L"TaskbarCreated");
 
     LoadHotkeys();
+    LoadCapturePreference();
 
     if (!InitInstance(
         hInstance,

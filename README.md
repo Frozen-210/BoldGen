@@ -62,6 +62,24 @@ Click **OK** to save shortcut changes or **Cancel** to discard them. Preferences
 are saved for the current Windows user. Choose **Exit** from the tray menu to
 close BoldGen.
 
+### Settings options
+
+- **Run at startup** starts BoldGen in the tray when the current Windows user signs
+  in. Check or uncheck it and click **OK** to add or remove BoldGen's entry in the
+  user's `Software\Microsoft\Windows\CurrentVersion\Run` registry key. The entry
+  uses the current executable's path; keep that build in a stable location.
+- **?** opens the About dialog.
+- **Eye / crossed eye** toggles whether Settings and About appear in screen
+  captures. The eye means visible; the crossed eye means excluded. The change is
+  previewed immediately; **OK** saves it for future launches and **Cancel** discards
+  it. The compact **?** and eye buttons are in the top-right corner; the startup
+  checkbox shares the bottom row with **OK** and **Cancel**.
+
+Capture exclusion uses [`WDA_EXCLUDEFROMCAPTURE`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity),
+supported starting with Windows 10 version 2004. Older Windows versions may show
+a blank window in captures instead of excluding it. This setting applies to
+BoldGen's dialogs, not to the application whose text is being transformed.
+
 ## Behavior and limitations
 
 - Styles replace characters with Unicode equivalents; they do not apply rich-text
@@ -106,6 +124,10 @@ key repeats, injected input, delayed copy, clipboard contention, focus changes,
 input failures, Unicode conversions, and clipboard backup/restoration (including
 multiple formats, images, cancellation, and preservation of newer clipboard data).
 The native test checks all seven styles and Windows-synthesized clipboard formats.
+It also exercises the Settings controls, About dialog, OK/Cancel behavior, and
+startup preferences using a temporary, redirected registry location. Capture API
+calls are simulated in that isolated desktop test; it verifies the requested
+flags and UI state, not the resulting output of screen-recording software.
 
 For a live check, launch your build, select text in Notepad, and try each style
 and Reset. Test any conflicting shortcut with the other application running;

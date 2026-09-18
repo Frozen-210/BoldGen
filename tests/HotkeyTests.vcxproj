@@ -33,5 +33,6 @@
     <Link><SubSystem>Console</SubSystem></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="$(TestSource)" /></ItemGroup>
+  <ItemGroup><ResourceCompile Include="..\BoldGen\BoldGen.rc" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
